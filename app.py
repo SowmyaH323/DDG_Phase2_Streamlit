@@ -18,8 +18,8 @@ DEVICE = "cpu"
 DRIVE_BASE = Path("/content/drive/MyDrive/DDG_Phase2")
 PDB_ROOT = DRIVE_BASE / "pdbs"
 ARTIFACTS_DIR = DRIVE_BASE / "artifacts_phase2"
-OUT_DIR = ARTIFACTS_DIR / "outputs"
-OUT_DIR.mkdir(exist_ok=True, parents=True)
+OUT_DIR = Path("/tmp/outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 XGB_PATH  = ARTIFACTS_DIR / "xgb_phase2_v4w_huber_weighted.json"
 BIAS_PATH = ARTIFACTS_DIR / "xgb_v4w_bias.txt"
@@ -360,3 +360,4 @@ with tab2:
             save_path = OUT_DIR / f"scan_{pdb_id2}_{chain2}_pos{pos}.csv"
             scan_prior.to_csv(save_path, index=False)
             st.success(f"Saved automatically to: {save_path}")
+
