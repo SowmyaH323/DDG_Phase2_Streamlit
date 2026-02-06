@@ -25,7 +25,7 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 XGB_PATH  = BASE_DIR / "xgb_phase2_v4w_huber_weighted.json"   # you said latest
 BIAS_PATH = BASE_DIR / "xgb_v4w_bias.txt"
 CNN_PATH  = BASE_DIR / "cnn_phase2_v2_best.pt"
-GNN_PATH = "gnn_phase2_best_scripted.pt"
+GNN_PATH = "gnn_phase2_best_scripted_state_dict.pt"
 gnn_model = torch.jit.load(GNN_PATH, map_location="cpu")
 gnn_model.eval()
 
@@ -423,6 +423,7 @@ with col2:
 
 st.markdown("---")
 st.caption("Note: This app writes outputs only to memory/downloads (Streamlit Cloud file system is read-only).")
+
 
 
 
