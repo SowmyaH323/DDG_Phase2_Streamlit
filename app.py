@@ -265,7 +265,7 @@ def cnn_predict_one(cnn_model, pdb_path: str, chain_id: str, mutation: str):
             y = cnn_model(x_img, mvec).item()
         return float(y), bool(has_pos)
     except Exception as e:
-        st.warning(f"CNN error for {mutation}: {e}")
+        st.error(f"CNN error for {mutation}: {repr(e)}")
         return 0.0, False
 
 
@@ -423,7 +423,43 @@ pdb_path = OUT_DIR / f"{pdb_id}.pdb"
 pdb_path.write_bytes(pdb_bytes)
 
 st.success(f"Using PDB: {pdb_id}.pdb (saved in outputs/)")
+def aa3_to_aa1(resname3: str) -> str:
+    m = {
+        "ALA":"A","CYS":"C","ASP":"D","GLU":"E","PHE":"F","GLY":"G","HIS":"H","ILE":"I","LYS":"K",
+        "LEU":"L","MET":"M","ASN":"N","PRO":"P","GLN":"Q","ARG":"R","SER":"S","THR":"T","VAL":"V",
+        "TRP":"W","TYR":"Y"
+    }
+    return m.get(resname3.upper(), "X")
 
+with st.expander("🔎 PDB Inspector (chains + residue numbers)", expanded=True):
+    struct = PDBParserObj.get_structure("u", str(pdb_path))
+    model = list(struct)[0]
+    chains = [c.id for c in model]
+    st.write("Chains found:", chains)
+
+    sel_chain = st.selectbox("Pick chain from PDB", chains, index=0)
+    residues = []
+    for res in model[sel_chain]:
+        if "CA" in res:
+            residues.append(res)
+
+    st.write("Residues with CA:", len(residues))
+    if residues:
+        ids = [r.id[1] for r in residues]
+        st.write("Residue number range:", min(ids), "to", max(ids))
+
+        preview = []
+        for r in residues[:25]:
+            preview.append({
+                "resnum": r.id[1],
+                "icode": r.id[2],
+                "aa": aa3_to_aa1(r.get_resname()),
+                "resname": r.get_resname()
+            })
+        st.dataframe(pd.DataFrame(preview), use_container_width=True)
+
+    # overwrite chain_id input with chosen chain automatically (optional)
+    chain_id = sel_chain
 if run_one:
     try:
         out = predict_ensemble_one(str(pdb_path), pdb_id, chain_id, mut_str, weights=weights)
@@ -462,6 +498,7 @@ if run_scan:
 
     except Exception as e:
         st.error(f"Scan failed: {e}")
+
 
 
 
