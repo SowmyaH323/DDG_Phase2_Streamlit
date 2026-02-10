@@ -33,9 +33,10 @@ PARSER = PDBParser(QUIET=True)
 REPO = Path(".")
 XGB_PATH  = REPO / "xgb_phase2_v4w_huber_weighted.json"
 BIAS_PATH = REPO / "xgb_v4w_bias.txt"
+CNN_PATH = Path("CNN_FULL_MODEL.pt")
+GNN_PATH = Path("GNN_FULL_MODEL.pt")
 cnn_model = torch.load(CNN_PATH, map_location="cpu")
 cnn_model.eval()
-
 gnn_model = torch.load(GNN_PATH, map_location="cpu")
 gnn_model.eval()
 
@@ -390,6 +391,7 @@ with right:
             file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
             mime="text/csv"
         )
+
 
 
 
