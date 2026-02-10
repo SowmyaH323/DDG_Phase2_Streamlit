@@ -33,8 +33,12 @@ PARSER = PDBParser(QUIET=True)
 REPO = Path(".")
 XGB_PATH  = REPO / "xgb_phase2_v4w_huber_weighted.json"
 BIAS_PATH = REPO / "xgb_v4w_bias.txt"
-CNN_PATH  = REPO / "cnn_phase2_v2_best.pt"
-GNN_PATH  = REPO / "gnn_phase2_best.pt"
+cnn_model = torch.load(CNN_PATH, map_location="cpu")
+cnn_model.eval()
+
+gnn_model = torch.load(GNN_PATH, map_location="cpu")
+gnn_model.eval()
+
 
 # Where to store uploaded PDB temporarily (allowed)
 TMP_DIR = Path("/tmp/ddg_phase2")
@@ -386,6 +390,7 @@ with right:
             file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
             mime="text/csv"
         )
+
 
 
 
