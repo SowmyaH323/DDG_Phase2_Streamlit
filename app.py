@@ -77,7 +77,7 @@ def confidence_label(cnn_ok: bool, gnn_ok: bool) -> str:
 # CNN architecture (matches your saved keys pattern)
 # -----------------------------
 class MutationAwareCNNv2(nn.Module):
-    """
+    
     Matches your checkpoint: head.0.weight is [64,80]
     =>
     """
@@ -438,6 +438,7 @@ with right:
             file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
             mime="text/csv"
         )
+
 
 
 
