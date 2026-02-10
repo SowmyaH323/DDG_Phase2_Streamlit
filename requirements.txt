@@ -1,6 +1,8 @@
 streamlit
 numpy
 pandas
-torch
 xgboost
+torch
 biopython
+torch-geometric
+matplotlib
