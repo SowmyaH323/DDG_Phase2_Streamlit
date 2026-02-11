@@ -76,11 +76,24 @@ def confidence_label(cnn_ok: bool, gnn_ok: bool) -> str:
 # -----------------------------
 # CNN architecture (matches your saved keys pattern)
 # -----------------------------
+import torch.nn as nn
+import torch.nn.functional as F
+
 class MutationAwareCNNv2(nn.Module):
-    
-    Matches your checkpoint: head.0.weight is [64,80]
-    =>
     """
+    Phase-2 CNN architecture (matches checkpoint):
+    CNN pooled embedding = 64
+    Mutation embedding = 16
+    concat => 80
+    head.0 = Linear(80 -> 64)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(2, 16, kernel_size=3, padding=1),
+            nn.ReLU
     Minimal CNN that matches the checkpoint patterns you showed earlier:
     cnn.0, cnn.3, cnn.6, cnn.9 + head.*
     Input: (B,2,128,128) -> output (B,1)
@@ -438,6 +451,7 @@ with right:
             file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
             mime="text/csv"
         )
+
 
 
 
