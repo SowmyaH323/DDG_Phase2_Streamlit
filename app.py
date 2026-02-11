@@ -13,7 +13,9 @@ import xgboost as xgb
 
 from Bio.PDB import PDBParser
 
-# PyG
+# -----------------------------
+# PyG (GNN)
+# -----------------------------
 try:
     from torch_geometric.data import Data
     from torch_geometric.nn import GCNConv, global_mean_pool
@@ -26,19 +28,22 @@ st.set_page_config(page_title="ΔΔG Phase-2 Mutation Scanner", layout="wide")
 DEVICE = "cpu"
 PARSER = PDBParser(QUIET=True)
 
+# -----------------------------
+# Repo paths (files in repo root)
+# -----------------------------
 REPO = Path(".")
 XGB_PATH  = REPO / "xgb_phase2_v4w_huber_weighted.json"
 BIAS_PATH = REPO / "xgb_v4w_bias.txt"
 
-# Use whatever file names you uploaded
-CNN_PATH = REPO / "cnn_phase2_v2_best.pt"
-GNN_PATH = REPO / "gnn_phase2_best.pt"
+CNN_PATH  = REPO / "cnn_phase2_v2_best.pt"
+GNN_PATH  = REPO / "gnn_phase2_best.pt"
 
+# Temp storage (Streamlit Cloud allows /tmp)
 TMP_DIR = Path("/tmp/ddg_phase2")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
-# AA utils
+# AA utilities
 # -----------------------------
 AA_LIST = list("ACDEFGHIKLMNPQRSTVWY")
 AA_INDEX = {a: i for i, a in enumerate(AA_LIST)}
@@ -74,60 +79,53 @@ def confidence_label(cnn_ok: bool, gnn_ok: bool) -> str:
     return "Low"
 
 # -----------------------------
-# CNN architecture (matches your saved keys pattern)
+# Phase-2 CNN architecture (MATCHES YOUR CHECKPOINT KEYS)
+# - conv keys: cnn.0, cnn.3, cnn.6, cnn.9
+# - mut_mlp keys: mut_mlp.0, mut_mlp.2
+# - head last layer key: head.3 (so include a dummy Dropout at index 2)
 # -----------------------------
-import torch.nn as nn
-import torch.nn.functional as F
-
 class MutationAwareCNNv2(nn.Module):
-    """
-    Phase-2 CNN architecture (matches checkpoint):
-    CNN pooled embedding = 64
-    Mutation embedding = 16
-    concat => 80
-    head.0 = Linear(80 -> 64)
-    """
-
     def __init__(self):
         super().__init__()
 
-        self.cnn = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=3, padding=1),
-            nn.ReLU
-    Minimal CNN that matches the checkpoint patterns you showed earlier:
-    cnn.0, cnn.3, cnn.6, cnn.9 + head.*
-    Input: (B,2,128,128) -> output (B,1)
-    """
-    def __init__(self):
-        super().__init__()
         self.cnn = nn.Sequential(
             nn.Conv2d(2, 16, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),  # 64
+            nn.MaxPool2d(2),                 # -> 64
             nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),  # 32
+            nn.MaxPool2d(2),                 # -> 32
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),  # 16
+            nn.MaxPool2d(2),                 # -> 16
             nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1,1))
+            nn.AdaptiveAvgPool2d((1, 1))
         )
+
+        # 4-d mutation vector -> 16 -> 16
+        self.mut_mlp = nn.Sequential(
+            nn.Linear(4, 16), nn.ReLU(),
+            nn.Linear(16, 16), nn.ReLU()
+        )
+
+        # concat (64 + 16 = 80) -> 64 -> 1
+        # head.3 exists because we include Dropout at head.2
         self.head = nn.Sequential(
-            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(80, 64), nn.ReLU(),
+            nn.Dropout(p=0.0),
             nn.Linear(64, 1)
         )
 
-    def forward(self, x):
-        z = self.cnn(x).squeeze(-1).squeeze(-1)
-        y = self.head(z)
+    def forward(self, x, mut_vec):
+        z = self.cnn(x).view(x.size(0), -1)     # (B,64)
+        m = self.mut_mlp(mut_vec)               # (B,16)
+        h = torch.cat([z, m], dim=1)            # (B,80)
+        y = self.head(h)                        # (B,1)
         return y.squeeze(-1)
 
 # -----------------------------
-# GNN architecture (Phase-2 style: conv1/2/3 + head.*)
+# Phase-2 GNN architecture (MATCHES YOUR CHECKPOINT KEYS)
+# - conv keys: conv1.*, conv2.*, conv3.*
+# - head last layer key: head.3 (include dummy Dropout at head.2)
 # -----------------------------
 class MutationAwareGNN(nn.Module):
-    """
-    Uses PyG GCNConv layers:
-    in_dim=25, hidden=64 (matches your earlier mismatches), out=1
-    """
     def __init__(self, in_dim=25, hidden_dim=64):
         super().__init__()
         if not PYG_OK:
@@ -139,6 +137,7 @@ class MutationAwareGNN(nn.Module):
 
         self.head = nn.Sequential(
             nn.Linear(32, 32), nn.ReLU(),
+            nn.Dropout(p=0.0),
             nn.Linear(32, 1)
         )
 
@@ -162,61 +161,46 @@ class MutationAwareGNN(nn.Module):
 @st.cache_resource(show_spinner=False)
 def load_models():
     # XGB
+    if not XGB_PATH.exists():
+        raise FileNotFoundError(f"Missing XGB file: {XGB_PATH.name}")
     booster = xgb.Booster()
     booster.load_model(str(XGB_PATH))
-    xgb_bias = float(BIAS_PATH.read_text().strip()) if BIAS_PATH.exists() else 0.0
+
+    xgb_bias = 0.0
+    if BIAS_PATH.exists():
+        xgb_bias = float(BIAS_PATH.read_text().strip())
 
     # CNN
+    if not CNN_PATH.exists():
+        raise FileNotFoundError(f"Missing CNN file: {CNN_PATH.name}")
+
     cnn_obj = torch.load(CNN_PATH, map_location=DEVICE)
-    if isinstance(cnn_obj, dict):
+    if isinstance(cnn_obj, dict):  # state_dict
         cnn_model = MutationAwareCNNv2().to(DEVICE)
-        missing, unexpected = cnn_model.load_state_dict(cnn_obj, strict=False)
-    else:
+        cnn_model.load_state_dict(cnn_obj, strict=False)
+    else:  # full model
         cnn_model = cnn_obj
-        missing, unexpected = [], []
     cnn_model.eval()
 
     # GNN
+    if not GNN_PATH.exists():
+        raise FileNotFoundError(f"Missing GNN file: {GNN_PATH.name}")
+
     gnn_obj = torch.load(GNN_PATH, map_location=DEVICE)
-    if isinstance(gnn_obj, dict):
+    if isinstance(gnn_obj, dict):  # state_dict
         if not PYG_OK:
-            raise RuntimeError("GNN is state_dict but torch_geometric is not available.")
+            raise RuntimeError("GNN needs torch_geometric, but it's not available. Fix requirements.txt.")
         gnn_model = MutationAwareGNN(in_dim=25, hidden_dim=64).to(DEVICE)
-        missing2, unexpected2 = gnn_model.load_state_dict(gnn_obj, strict=False)
-    else:
+        gnn_model.load_state_dict(gnn_obj, strict=False)
+    else:  # full model
         gnn_model = gnn_obj
-        missing2, unexpected2 = [], []
     gnn_model.eval()
 
-    meta = {
-        "cnn_missing": list(missing) if isinstance(missing, (list, tuple)) else [],
-        "cnn_unexpected": list(unexpected) if isinstance(unexpected, (list, tuple)) else [],
-        "gnn_missing": list(missing2) if isinstance(missing2, (list, tuple)) else [],
-        "gnn_unexpected": list(unexpected2) if isinstance(unexpected2, (list, tuple)) else [],
-    }
-
-    return booster, xgb_bias, cnn_model, gnn_model, meta
+    return booster, xgb_bias, cnn_model, gnn_model
 
 # -----------------------------
-# Prediction helpers
+# Structure helpers
 # -----------------------------
-def xgb_predict_one(booster, bias: float, mutation: str):
-    wt, pos, mt = parse_mutation(mutation)
-    wt_vec = np.zeros(20, dtype=np.float32); mt_vec = np.zeros(20, dtype=np.float32)
-    wt_vec[AA_INDEX[wt]] = 1.0
-    mt_vec[AA_INDEX[mt]] = 1.0
-
-    feat = np.concatenate([
-        wt_vec, mt_vec,
-        np.array([pos,
-                  HYDRO[mt]-HYDRO[wt],
-                  VOLUME[mt]-VOLUME[wt],
-                  CHARGE[mt]-CHARGE[wt]], dtype=np.float32)
-    ])
-    dmat = xgb.DMatrix(feat.reshape(1, -1))
-    pred = float(booster.predict(dmat)[0] + bias)
-    return pred, True
-
 def get_chain_residues_with_ca(structure, chain_id: str):
     residues = []
     for model in structure:
@@ -235,9 +219,33 @@ def wt_aa_from_pdb(pdb_path: str, chain_id: str, pos: int):
             return AA3_TO_1.get(r.get_resname().upper(), None)
     return None
 
+# -----------------------------
+# Predictions
+# -----------------------------
+def xgb_predict_one(booster, bias: float, mutation: str):
+    wt, pos, mt = parse_mutation(mutation)
+
+    wt_vec = np.zeros(20, dtype=np.float32)
+    mt_vec = np.zeros(20, dtype=np.float32)
+    wt_vec[AA_INDEX[wt]] = 1.0
+    mt_vec[AA_INDEX[mt]] = 1.0
+
+    feat = np.concatenate([
+        wt_vec, mt_vec,
+        np.array([pos,
+                  HYDRO[mt] - HYDRO[wt],
+                  VOLUME[mt] - VOLUME[wt],
+                  CHARGE[mt] - CHARGE[wt]], dtype=np.float32)
+    ])
+
+    dmat = xgb.DMatrix(feat.reshape(1, -1))
+    pred = float(booster.predict(dmat)[0] + bias)
+    return pred, True
+
 def cnn_predict_one(cnn_model, pdb_path: str, chain_id: str, mutation: str, cutoff=8.0, H=128):
     try:
         wt, pos, mt = parse_mutation(mutation)
+
         structure = PARSER.get_structure("p", pdb_path)
         residues = get_chain_residues_with_ca(structure, chain_id)
         if len(residues) == 0:
@@ -246,12 +254,14 @@ def cnn_predict_one(cnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
         coords = np.array([r["CA"].coord for r in residues], dtype=np.float32)
         n = len(coords)
 
+        # Contact map
         cmap = np.zeros((n, n), dtype=np.float32)
         for i in range(n):
-            for j in range(i+1, n):
+            for j in range(i + 1, n):
                 if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
                     cmap[i, j] = cmap[j, i] = 1.0
 
+        # Find residue index for mutation position
         idx = None
         for i, r in enumerate(residues):
             if r.id[1] == pos:
@@ -265,12 +275,21 @@ def cnn_predict_one(cnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
         mask[:, idx] = 1.0
 
         X = np.zeros((2, H, H), dtype=np.float32)
-        X[0, :min(n,H), :min(n,H)] = cmap[:H, :H]
-        X[1, :min(n,H), :min(n,H)] = mask[:H, :H]
+        m = min(n, H)
+        X[0, :m, :m] = cmap[:m, :m]
+        X[1, :m, :m] = mask[:m, :m]
+
+        # 4-d mutation vector (dh, dv, dq, 1)
+        dh = HYDRO[mt] - HYDRO[wt]
+        dv = VOLUME[mt] - VOLUME[wt]
+        dq = CHARGE[mt] - CHARGE[wt]
+        mut_vec = np.array([[dh, dv, dq, 1.0]], dtype=np.float32)
 
         with torch.no_grad():
             t = torch.tensor(X, dtype=torch.float32).unsqueeze(0)
-            y = cnn_model(t).item()
+            mv = torch.tensor(mut_vec, dtype=torch.float32)
+            y = cnn_model(t, mv).item()
+
         return float(y), True
     except Exception:
         return 0.0, False
@@ -278,19 +297,23 @@ def cnn_predict_one(cnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
 def gnn_predict_one(gnn_model, pdb_path: str, chain_id: str, mutation: str, cutoff=8.0):
     if not PYG_OK:
         return 0.0, False
+
     try:
         wt, pos, mt = parse_mutation(mutation)
+
         structure = PARSER.get_structure("p", pdb_path)
         residues = get_chain_residues_with_ca(structure, chain_id)
         if len(residues) == 0:
             return 0.0, False
 
         coords = np.array([r["CA"].coord for r in residues], dtype=np.float32)
+
         edges = []
         for i in range(len(coords)):
-            for j in range(i+1, len(coords)):
+            for j in range(i + 1, len(coords)):
                 if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
-                    edges.append([i, j]); edges.append([j, i])
+                    edges.append([i, j])
+                    edges.append([j, i])
         if len(edges) == 0:
             return 0.0, False
 
@@ -309,6 +332,8 @@ def gnn_predict_one(gnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
         dh = HYDRO[mt] - HYDRO[wt]
         dv = VOLUME[mt] - VOLUME[wt]
         dq = CHARGE[mt] - CHARGE[wt]
+
+        # extra 5 dims: is_mut, dh, dv, dq, 1
         x[:, 20] = 0.0
         x[mut_idx, 20] = 1.0
         x[:, 21] = dh
@@ -317,36 +342,42 @@ def gnn_predict_one(gnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
         x[:, 24] = 1.0
 
         data = Data(x=x, edge_index=edge_index)
+        data.batch = torch.zeros(x.size(0), dtype=torch.long)
+
         with torch.no_grad():
             y = gnn_model(data).item()
+
         return float(y), True
     except Exception:
         return 0.0, False
 
 def predict_ensemble_one(booster, bias, cnn_model, gnn_model, pdb_path: str, chain_id: str, mutation: str, weights):
     w_xgb, w_cnn, w_gnn = weights
+
     xgb_p, _ = xgb_predict_one(booster, bias, mutation)
     cnn_p, cnn_ok = cnn_predict_one(cnn_model, pdb_path, chain_id, mutation)
     gnn_p, gnn_ok = gnn_predict_one(gnn_model, pdb_path, chain_id, mutation)
+
     ens = (w_xgb * xgb_p) + (w_cnn * cnn_p) + (w_gnn * gnn_p)
+
     return {
         "mutation": mutation,
-        "xgb": xgb_p,
-        "cnn": cnn_p,
-        "gnn": gnn_p,
+        "xgb": float(xgb_p),
+        "cnn": float(cnn_p),
+        "gnn": float(gnn_p),
         "ens": float(ens),
-        "cnn_ok": cnn_ok,
-        "gnn_ok": gnn_ok
+        "cnn_ok": bool(cnn_ok),
+        "gnn_ok": bool(gnn_ok),
     }
 
 def scan_19aa(pdb_path: str, chain_id: str, pos: int, wt_aa: str, booster, bias, cnn_model, gnn_model, weights):
-    out_rows = []
+    rows = []
     for aa in AA_LIST:
         if aa == wt_aa:
             continue
         mut = f"{wt_aa}{pos}{aa}"
-        out_rows.append(predict_ensemble_one(booster, bias, cnn_model, gnn_model, pdb_path, chain_id, mut, weights))
-    return pd.DataFrame(out_rows)
+        rows.append(predict_ensemble_one(booster, bias, cnn_model, gnn_model, pdb_path, chain_id, mut, weights))
+    return pd.DataFrame(rows)
 
 def prioritize_scan(scan_df: pd.DataFrame, pdb_id: str, chain_id: str, top_k=5):
     dfp = scan_df.copy()
@@ -354,15 +385,15 @@ def prioritize_scan(scan_df: pd.DataFrame, pdb_id: str, chain_id: str, top_k=5):
     dfp["chain"] = chain_id
 
     dfp = dfp.sort_values("ens", ascending=True).reset_index(drop=True)
-    dfp["rank_stabilizing"] = np.arange(1, len(dfp)+1)
+    dfp["rank_stabilizing"] = np.arange(1, len(dfp) + 1)
     dfp["pct"] = dfp["rank_stabilizing"] / len(dfp)
 
     dfp["ddg_class"] = dfp["ens"].apply(ddg_class)
     dfp["confidence"] = [confidence_label(c, g) for c, g in zip(dfp["cnn_ok"], dfp["gnn_ok"])]
 
     dfp["highlight"] = ""
-    dfp.loc[:top_k-1, "highlight"] = "TOP stabilizing"
-    dfp.loc[len(dfp)-top_k:, "highlight"] = "TOP destabilizing"
+    dfp.loc[:top_k - 1, "highlight"] = "TOP stabilizing"
+    dfp.loc[len(dfp) - top_k:, "highlight"] = "TOP destabilizing"
     return dfp
 
 # -----------------------------
@@ -409,18 +440,15 @@ with right:
         pdb_path.write_bytes(pdb_bytes)
 
         try:
-            booster, bias, cnn_model, gnn_model, meta = load_models()
-            st.success(f"Models loaded. XGB bias={bias:.4f}")
-            if meta["cnn_missing"] or meta["cnn_unexpected"] or meta["gnn_missing"] or meta["gnn_unexpected"]:
-                with st.expander("Model load details (missing/unexpected keys)"):
-                    st.write(meta)
+            booster, bias, cnn_model, gnn_model = load_models()
+            st.success(f"Models loaded. XGB bias = {bias:.4f}")
         except Exception as e:
             st.error(f"Model load failed: {e}")
             st.stop()
 
         wt_aa = wt_override if wt_override in AA_INDEX else wt_aa_from_pdb(str(pdb_path), chain_id, int(pos))
         if wt_aa is None:
-            st.error("Could not detect WT amino acid from PDB at this chain/position. Please enter WT override.")
+            st.error("Could not detect WT AA from PDB at this chain/position. Please enter WT override.")
             st.stop()
 
         st.info(f"Using PDB: {pdb_name}.pdb | chain: {chain_id} | position: {int(pos)} | WT: {wt_aa}")
@@ -451,6 +479,8 @@ with right:
             file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
             mime="text/csv"
         )
+
+
 
 
 
