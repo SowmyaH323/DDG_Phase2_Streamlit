@@ -161,43 +161,44 @@ class MutationAwareGNN(nn.Module):
 @st.cache_resource(show_spinner=False)
 def load_models():
     # XGB
-    if not XGB_PATH.exists():
-        raise FileNotFoundError(f"Missing XGB file: {XGB_PATH.name}")
     booster = xgb.Booster()
     booster.load_model(str(XGB_PATH))
+    xgb_bias = float(BIAS_PATH.read_text().strip()) if BIAS_PATH.exists() else 0.0
 
-    xgb_bias = 0.0
-    if BIAS_PATH.exists():
-        xgb_bias = float(BIAS_PATH.read_text().strip())
-
-    # CNN
-    if not CNN_PATH.exists():
-        raise FileNotFoundError(f"Missing CNN file: {CNN_PATH.name}")
-
+    # CNN (supports full model OR state_dict)
     cnn_obj = torch.load(CNN_PATH, map_location=DEVICE)
-    if isinstance(cnn_obj, dict):  # state_dict
+    if isinstance(cnn_obj, dict):
         cnn_model = MutationAwareCNNv2().to(DEVICE)
-        cnn_model.load_state_dict(cnn_obj, strict=False)
-    else:  # full model
+        incompatible = cnn_model.load_state_dict(cnn_obj, strict=False)
+        cnn_missing = list(incompatible.missing_keys)
+        cnn_unexpected = list(incompatible.unexpected_keys)
+    else:
         cnn_model = cnn_obj
+        cnn_missing, cnn_unexpected = [], []
     cnn_model.eval()
 
-    # GNN
-    if not GNN_PATH.exists():
-        raise FileNotFoundError(f"Missing GNN file: {GNN_PATH.name}")
-
+    # GNN (supports full model OR state_dict)
     gnn_obj = torch.load(GNN_PATH, map_location=DEVICE)
-    if isinstance(gnn_obj, dict):  # state_dict
+    if isinstance(gnn_obj, dict):
         if not PYG_OK:
-            raise RuntimeError("GNN needs torch_geometric, but it's not available. Fix requirements.txt.")
+            raise RuntimeError("GNN is a state_dict but torch_geometric is not available.")
         gnn_model = MutationAwareGNN(in_dim=25, hidden_dim=64).to(DEVICE)
-        gnn_model.load_state_dict(gnn_obj, strict=False)
-    else:  # full model
+        incompatible2 = gnn_model.load_state_dict(gnn_obj, strict=False)
+        gnn_missing = list(incompatible2.missing_keys)
+        gnn_unexpected = list(incompatible2.unexpected_keys)
+    else:
         gnn_model = gnn_obj
+        gnn_missing, gnn_unexpected = [], []
     gnn_model.eval()
 
-    return booster, xgb_bias, cnn_model, gnn_model
+    meta = {
+        "cnn_missing": cnn_missing,
+        "cnn_unexpected": cnn_unexpected,
+        "gnn_missing": gnn_missing,
+        "gnn_unexpected": gnn_unexpected,
+    }
 
+    return booster, xgb_bias, cnn_model, gnn_model, meta
 # -----------------------------
 # Structure helpers
 # -----------------------------
@@ -652,6 +653,7 @@ with right:
             file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
             mime="text/csv"
         )
+
 
 
 
