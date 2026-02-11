@@ -395,7 +395,56 @@ def prioritize_scan(scan_df: pd.DataFrame, pdb_id: str, chain_id: str, top_k=5):
     dfp.loc[:top_k - 1, "highlight"] = "TOP stabilizing"
     dfp.loc[len(dfp) - top_k:, "highlight"] = "TOP destabilizing"
     return dfp
+def clean_fasta_to_sequence(text: str) -> str:
+    """
+    Accepts FASTA (with >header) or raw sequence.
+    Returns uppercase sequence with only AAs.
+    """
+    if text is None:
+        return ""
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    if lines[0].startswith(">"):
+        lines = lines[1:]
+    seq = "".join(lines).upper()
+    # keep only letters (remove spaces, numbers, etc.)
+    seq = re.sub(r"[^A-Z]", "", seq)
+    return seq
 
+def wt_from_fasta(seq: str, pos_1based: int) -> str | None:
+    if not seq:
+        return None
+    if pos_1based < 1 or pos_1based > len(seq):
+        return None
+    wt = seq[pos_1based - 1]
+    return wt if wt in AA_INDEX else None
+
+def scan_19aa_xgb_only(seq: str, pos: int, booster, bias):
+    """
+    19-AA scan using ONLY XGB.
+    pos is 1-based residue number.
+    """
+    wt = wt_from_fasta(seq, pos)
+    if wt is None:
+        raise ValueError("WT could not be determined from FASTA at this position.")
+
+    out_rows = []
+    for aa in AA_LIST:
+        if aa == wt:
+            continue
+        mut = f"{wt}{pos}{aa}"
+        xgb_p, xgb_ok = xgb_predict_one(booster, bias, mut)
+        out_rows.append({
+            "mutation": mut,
+            "xgb": xgb_p,
+            "cnn": 0.0,
+            "gnn": 0.0,
+            "ens": float(xgb_p),     # ensemble = xgb only
+            "cnn_ok": False,
+            "gnn_ok": False,
+        })
+    return pd.DataFrame(out_rows), wt
 # -----------------------------
 # UI
 # -----------------------------
@@ -420,8 +469,132 @@ with left:
     st.caption(f"Normalized weights = {weights}")
 
 with right:
-    st.subheader("Upload PDB and run 19-AA scan")
+    st.subheader("Run predictions")
 
+    tab_pdb, tab_fasta = st.tabs(["PDB Mode (XGB+CNN+GNN)", "FASTA Mode (XGB only)"])
+
+    # ==========================================================
+    # TAB 1: PDB MODE (your existing flow)
+    # ==========================================================
+    with tab_pdb:
+        st.markdown("### Upload PDB and run 19-AA scan (structure-based)")
+
+        uploaded = st.file_uploader("Upload a PDB file", type=["pdb"], key="pdb_uploader")
+        chain_id = st.text_input("Chain ID", value="A", max_chars=2, key="pdb_chain")
+        pos = st.number_input("Position (residue number)", min_value=1, value=66, step=1, key="pdb_pos")
+        wt_override = st.text_input("WT AA override (optional, 1-letter)", value="", key="pdb_wt").strip().upper()
+
+        run = st.button("Run 19-AA scan (PDB mode)", key="run_pdb")
+
+        if run:
+            if uploaded is None:
+                st.error("Please upload a PDB file.")
+                st.stop()
+
+            pdb_bytes = uploaded.getvalue()
+            pdb_name = Path(uploaded.name).stem.upper()
+            pdb_path = TMP_DIR / f"{pdb_name}.pdb"
+            pdb_path.write_bytes(pdb_bytes)
+
+            try:
+                booster, bias, cnn_model, gnn_model, meta = load_models()
+                st.success(f"Models loaded. XGB bias={bias:.4f}")
+                if meta["cnn_missing"] or meta["cnn_unexpected"] or meta["gnn_missing"] or meta["gnn_unexpected"]:
+                    with st.expander("Model load details (missing/unexpected keys)"):
+                        st.write(meta)
+            except Exception as e:
+                st.error(f"Model load failed: {e}")
+                st.stop()
+
+            wt_aa = wt_override if wt_override in AA_INDEX else wt_aa_from_pdb(str(pdb_path), chain_id, int(pos))
+            if wt_aa is None:
+                st.error("Could not detect WT amino acid from PDB at this chain/position. Please enter WT override.")
+                st.stop()
+
+            st.info(f"Using PDB: {pdb_name}.pdb | chain: {chain_id} | position: {int(pos)} | WT: {wt_aa}")
+
+            scan_df = scan_19aa(
+                pdb_path=str(pdb_path),
+                chain_id=chain_id,
+                pos=int(pos),
+                wt_aa=wt_aa,
+                booster=booster,
+                bias=bias,
+                cnn_model=cnn_model,
+                gnn_model=gnn_model,
+                weights=weights
+            )
+            scan_prior = prioritize_scan(scan_df, pdb_id=pdb_name, chain_id=chain_id, top_k=5)
+
+            st.markdown("### 19-AA scan (ranked by ensemble; lower = more stabilizing)")
+            st.dataframe(scan_prior, use_container_width=True)
+
+            st.markdown("### Bar plot (ensemble ΔΔG per mutation)")
+            st.bar_chart(scan_prior.set_index("mutation")["ens"])
+
+            csv_bytes = scan_prior.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                data=csv_bytes,
+                file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
+                mime="text/csv"
+            )
+
+    # ==========================================================
+    # TAB 2: FASTA MODE (XGB ONLY)
+    # ==========================================================
+    with tab_fasta:
+        st.markdown("### Paste FASTA and run 19-AA scan (sequence-based, XGB only)")
+
+        fasta_text = st.text_area(
+            "FASTA sequence (or raw sequence)",
+            height=200,
+            placeholder=">my_protein\nMSTNPKPQR...\n",
+            key="fasta_text"
+        )
+
+        fasta_label = st.text_input("Protein label (for output filenames)", value="FASTA_PROTEIN", key="fasta_label")
+        pos_fa = st.number_input("Position (1-based residue number)", min_value=1, value=66, step=1, key="fasta_pos")
+
+        run_fa = st.button("Run 19-AA scan (FASTA mode)", key="run_fasta")
+
+        if run_fa:
+            seq = clean_fasta_to_sequence(fasta_text)
+            if not seq:
+                st.error("FASTA/sequence is empty. Please paste a sequence.")
+                st.stop()
+
+            try:
+                booster, bias, cnn_model, gnn_model, meta = load_models()
+                st.success(f"XGB loaded. Bias={bias:.4f} (FASTA mode uses XGB only)")
+            except Exception as e:
+                st.error(f"Model load failed: {e}")
+                st.stop()
+
+            wt = wt_from_fasta(seq, int(pos_fa))
+            if wt is None:
+                st.error(f"Position {int(pos_fa)} is out of range (sequence length={len(seq)}) or contains invalid AA.")
+                st.stop()
+
+            st.info(f"FASTA length: {len(seq)} | position: {int(pos_fa)} | WT from FASTA: {wt} | Mode: XGB only")
+
+            scan_df, wt_used = scan_19aa_xgb_only(seq, int(pos_fa), booster, bias)
+            # Use your existing prioritize_scan (it will mark confidence Low because cnn_ok/gnn_ok are False)
+            scan_prior = prioritize_scan(scan_df, pdb_id=fasta_label.strip().upper(), chain_id="FASTA", top_k=5)
+
+            st.markdown("### 19-AA scan (XGB-only; lower = more stabilizing)")
+            st.dataframe(scan_prior, use_container_width=True)
+
+            st.markdown("### Bar plot (XGB ΔΔG per mutation)")
+            st.bar_chart(scan_prior.set_index("mutation")["ens"])
+
+            csv_bytes = scan_prior.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                data=csv_bytes,
+                file_name=f"scan_{fasta_label.strip().upper()}_pos{int(pos_fa)}_XGBonly.csv",
+                mime="text/csv"
+            )
     uploaded = st.file_uploader("Upload a PDB file", type=["pdb"])
     chain_id = st.text_input("Chain ID", value="A", max_chars=2)
     pos = st.number_input("Position (residue number)", min_value=1, value=66, step=1)
@@ -479,6 +652,7 @@ with right:
             file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
             mime="text/csv"
         )
+
 
 
 
