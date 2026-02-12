@@ -34,7 +34,6 @@ PARSER = PDBParser(QUIET=True)
 REPO = Path(".")
 XGB_PATH  = REPO / "xgb_phase2_v4w_huber_weighted.json"
 BIAS_PATH = REPO / "xgb_v4w_bias.txt"
-
 CNN_PATH  = REPO / "cnn_phase2_v2_best.pt"
 GNN_PATH  = REPO / "gnn_phase2_best.pt"
 
@@ -79,34 +78,29 @@ def confidence_label(cnn_ok: bool, gnn_ok: bool) -> str:
     return "Low"
 
 # -----------------------------
-# Phase-2 CNN architecture (MATCHES YOUR CHECKPOINT KEYS)
-# - conv keys: cnn.0, cnn.3, cnn.6, cnn.9
-# - mut_mlp keys: mut_mlp.0, mut_mlp.2
-# - head last layer key: head.3 (so include a dummy Dropout at index 2)
+# Phase-2 CNN architecture
+# (matches your checkpoint key patterns)
 # -----------------------------
 class MutationAwareCNNv2(nn.Module):
     def __init__(self):
         super().__init__()
-
         self.cnn = nn.Sequential(
             nn.Conv2d(2, 16, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),                 # -> 64
+            nn.MaxPool2d(2),
             nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),                 # -> 32
+            nn.MaxPool2d(2),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),                 # -> 16
+            nn.MaxPool2d(2),
             nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
             nn.AdaptiveAvgPool2d((1, 1))
         )
 
-        # 4-d mutation vector -> 16 -> 16
         self.mut_mlp = nn.Sequential(
             nn.Linear(4, 16), nn.ReLU(),
             nn.Linear(16, 16), nn.ReLU()
         )
 
-        # concat (64 + 16 = 80) -> 64 -> 1
-        # head.3 exists because we include Dropout at head.2
+        # head.3 exists because of Dropout at index 2
         self.head = nn.Sequential(
             nn.Linear(80, 64), nn.ReLU(),
             nn.Dropout(p=0.0),
@@ -121,9 +115,7 @@ class MutationAwareCNNv2(nn.Module):
         return y.squeeze(-1)
 
 # -----------------------------
-# Phase-2 GNN architecture (MATCHES YOUR CHECKPOINT KEYS)
-# - conv keys: conv1.*, conv2.*, conv3.*
-# - head last layer key: head.3 (include dummy Dropout at head.2)
+# Phase-2 GNN architecture
 # -----------------------------
 class MutationAwareGNN(nn.Module):
     def __init__(self, in_dim=25, hidden_dim=64):
@@ -156,36 +148,35 @@ class MutationAwareGNN(nn.Module):
         return y.squeeze(-1)
 
 # -----------------------------
-# Load models (supports FULL model OR state_dict)
+# Load models
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_models():
-    # XGB
     booster = xgb.Booster()
     booster.load_model(str(XGB_PATH))
     xgb_bias = float(BIAS_PATH.read_text().strip()) if BIAS_PATH.exists() else 0.0
 
-    # CNN (supports full model OR state_dict)
+    # CNN
     cnn_obj = torch.load(CNN_PATH, map_location=DEVICE)
     if isinstance(cnn_obj, dict):
         cnn_model = MutationAwareCNNv2().to(DEVICE)
-        incompatible = cnn_model.load_state_dict(cnn_obj, strict=False)
-        cnn_missing = list(incompatible.missing_keys)
-        cnn_unexpected = list(incompatible.unexpected_keys)
+        inc = cnn_model.load_state_dict(cnn_obj, strict=False)
+        cnn_missing = list(getattr(inc, "missing_keys", []))
+        cnn_unexpected = list(getattr(inc, "unexpected_keys", []))
     else:
         cnn_model = cnn_obj
         cnn_missing, cnn_unexpected = [], []
     cnn_model.eval()
 
-    # GNN (supports full model OR state_dict)
+    # GNN
     gnn_obj = torch.load(GNN_PATH, map_location=DEVICE)
     if isinstance(gnn_obj, dict):
         if not PYG_OK:
             raise RuntimeError("GNN is a state_dict but torch_geometric is not available.")
         gnn_model = MutationAwareGNN(in_dim=25, hidden_dim=64).to(DEVICE)
-        incompatible2 = gnn_model.load_state_dict(gnn_obj, strict=False)
-        gnn_missing = list(incompatible2.missing_keys)
-        gnn_unexpected = list(incompatible2.unexpected_keys)
+        inc2 = gnn_model.load_state_dict(gnn_obj, strict=False)
+        gnn_missing = list(getattr(inc2, "missing_keys", []))
+        gnn_unexpected = list(getattr(inc2, "unexpected_keys", []))
     else:
         gnn_model = gnn_obj
         gnn_missing, gnn_unexpected = [], []
@@ -197,8 +188,8 @@ def load_models():
         "gnn_missing": gnn_missing,
         "gnn_unexpected": gnn_unexpected,
     }
-
     return booster, xgb_bias, cnn_model, gnn_model, meta
+
 # -----------------------------
 # Structure helpers
 # -----------------------------
@@ -255,14 +246,12 @@ def cnn_predict_one(cnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
         coords = np.array([r["CA"].coord for r in residues], dtype=np.float32)
         n = len(coords)
 
-        # Contact map
         cmap = np.zeros((n, n), dtype=np.float32)
         for i in range(n):
             for j in range(i + 1, n):
                 if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
                     cmap[i, j] = cmap[j, i] = 1.0
 
-        # Find residue index for mutation position
         idx = None
         for i, r in enumerate(residues):
             if r.id[1] == pos:
@@ -280,7 +269,6 @@ def cnn_predict_one(cnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
         X[0, :m, :m] = cmap[:m, :m]
         X[1, :m, :m] = mask[:m, :m]
 
-        # 4-d mutation vector (dh, dv, dq, 1)
         dh = HYDRO[mt] - HYDRO[wt]
         dv = VOLUME[mt] - VOLUME[wt]
         dq = CHARGE[mt] - CHARGE[wt]
@@ -334,7 +322,6 @@ def gnn_predict_one(gnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
         dv = VOLUME[mt] - VOLUME[wt]
         dq = CHARGE[mt] - CHARGE[wt]
 
-        # extra 5 dims: is_mut, dh, dv, dq, 1
         x[:, 20] = 0.0
         x[mut_idx, 20] = 1.0
         x[:, 21] = dh
@@ -354,13 +341,10 @@ def gnn_predict_one(gnn_model, pdb_path: str, chain_id: str, mutation: str, cuto
 
 def predict_ensemble_one(booster, bias, cnn_model, gnn_model, pdb_path: str, chain_id: str, mutation: str, weights):
     w_xgb, w_cnn, w_gnn = weights
-
     xgb_p, _ = xgb_predict_one(booster, bias, mutation)
     cnn_p, cnn_ok = cnn_predict_one(cnn_model, pdb_path, chain_id, mutation)
     gnn_p, gnn_ok = gnn_predict_one(gnn_model, pdb_path, chain_id, mutation)
-
     ens = (w_xgb * xgb_p) + (w_cnn * cnn_p) + (w_gnn * gnn_p)
-
     return {
         "mutation": mutation,
         "xgb": float(xgb_p),
@@ -384,23 +368,20 @@ def prioritize_scan(scan_df: pd.DataFrame, pdb_id: str, chain_id: str, top_k=5):
     dfp = scan_df.copy()
     dfp["PDB_ID"] = pdb_id
     dfp["chain"] = chain_id
-
     dfp = dfp.sort_values("ens", ascending=True).reset_index(drop=True)
     dfp["rank_stabilizing"] = np.arange(1, len(dfp) + 1)
     dfp["pct"] = dfp["rank_stabilizing"] / len(dfp)
-
     dfp["ddg_class"] = dfp["ens"].apply(ddg_class)
     dfp["confidence"] = [confidence_label(c, g) for c, g in zip(dfp["cnn_ok"], dfp["gnn_ok"])]
-
     dfp["highlight"] = ""
     dfp.loc[:top_k - 1, "highlight"] = "TOP stabilizing"
     dfp.loc[len(dfp) - top_k:, "highlight"] = "TOP destabilizing"
     return dfp
+
+# -----------------------------
+# FASTA helpers (XGB-only)
+# -----------------------------
 def clean_fasta_to_sequence(text: str) -> str:
-    """
-    Accepts FASTA (with >header) or raw sequence.
-    Returns uppercase sequence with only AAs.
-    """
     if text is None:
         return ""
     lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
@@ -409,11 +390,10 @@ def clean_fasta_to_sequence(text: str) -> str:
     if lines[0].startswith(">"):
         lines = lines[1:]
     seq = "".join(lines).upper()
-    # keep only letters (remove spaces, numbers, etc.)
     seq = re.sub(r"[^A-Z]", "", seq)
     return seq
 
-def wt_from_fasta(seq: str, pos_1based: int) -> str | None:
+def wt_from_fasta(seq: str, pos_1based: int):
     if not seq:
         return None
     if pos_1based < 1 or pos_1based > len(seq):
@@ -422,30 +402,26 @@ def wt_from_fasta(seq: str, pos_1based: int) -> str | None:
     return wt if wt in AA_INDEX else None
 
 def scan_19aa_xgb_only(seq: str, pos: int, booster, bias):
-    """
-    19-AA scan using ONLY XGB.
-    pos is 1-based residue number.
-    """
     wt = wt_from_fasta(seq, pos)
     if wt is None:
         raise ValueError("WT could not be determined from FASTA at this position.")
-
     out_rows = []
     for aa in AA_LIST:
         if aa == wt:
             continue
         mut = f"{wt}{pos}{aa}"
-        xgb_p, xgb_ok = xgb_predict_one(booster, bias, mut)
+        xgb_p, _ = xgb_predict_one(booster, bias, mut)
         out_rows.append({
             "mutation": mut,
-            "xgb": xgb_p,
+            "xgb": float(xgb_p),
             "cnn": 0.0,
             "gnn": 0.0,
-            "ens": float(xgb_p),     # ensemble = xgb only
+            "ens": float(xgb_p),
             "cnn_ok": False,
             "gnn_ok": False,
         })
     return pd.DataFrame(out_rows), wt
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -462,29 +438,26 @@ with left:
     st.write("PyG available:", PYG_OK)
 
     st.subheader("Ensemble weights")
-    wx = st.slider("XGB weight", 0.0, 1.0, 0.33, 0.01)
-    wc = st.slider("CNN weight", 0.0, 1.0, 0.33, 0.01)
-    wg = st.slider("GNN weight", 0.0, 1.0, 0.33, 0.01)
+    wx = st.slider("XGB weight", 0.0, 1.0, 0.33, 0.01, key="wx")
+    wc = st.slider("CNN weight", 0.0, 1.0, 0.33, 0.01, key="wc")
+    wg = st.slider("GNN weight", 0.0, 1.0, 0.33, 0.01, key="wg")
     s = wx + wc + wg
     weights = (1/3, 1/3, 1/3) if s == 0 else (wx/s, wc/s, wg/s)
     st.caption(f"Normalized weights = {weights}")
 
 with right:
     st.subheader("Run predictions")
-
     tab_pdb, tab_fasta = st.tabs(["PDB Mode (XGB+CNN+GNN)", "FASTA Mode (XGB only)"])
 
-    # ==========================================================
-    # TAB 1: PDB MODE (your existing flow)
-    # ==========================================================
+    # -------------------------
+    # TAB 1: PDB MODE
+    # -------------------------
     with tab_pdb:
         st.markdown("### Upload PDB and run 19-AA scan (structure-based)")
-
         uploaded = st.file_uploader("Upload a PDB file", type=["pdb"], key="pdb_uploader")
         chain_id = st.text_input("Chain ID", value="A", max_chars=2, key="pdb_chain")
         pos = st.number_input("Position (residue number)", min_value=1, value=66, step=1, key="pdb_pos")
         wt_override = st.text_input("WT AA override (optional, 1-letter)", value="", key="pdb_wt").strip().upper()
-
         run = st.button("Run 19-AA scan (PDB mode)", key="run_pdb")
 
         if run:
@@ -499,13 +472,14 @@ with right:
 
             try:
                 booster, bias, cnn_model, gnn_model, meta = load_models()
-                st.success(f"Models loaded. XGB bias={bias:.4f}")
-                if meta["cnn_missing"] or meta["cnn_unexpected"] or meta["gnn_missing"] or meta["gnn_unexpected"]:
-                    with st.expander("Model load details (missing/unexpected keys)"):
-                        st.write(meta)
             except Exception as e:
                 st.error(f"Model load failed: {e}")
                 st.stop()
+
+            st.success(f"Models loaded. XGB bias={bias:.4f}")
+            if meta["cnn_missing"] or meta["cnn_unexpected"] or meta["gnn_missing"] or meta["gnn_unexpected"]:
+                with st.expander("Model load details (missing/unexpected keys)"):
+                    st.write(meta)
 
             wt_aa = wt_override if wt_override in AA_INDEX else wt_aa_from_pdb(str(pdb_path), chain_id, int(pos))
             if wt_aa is None:
@@ -527,8 +501,18 @@ with right:
             )
             scan_prior = prioritize_scan(scan_df, pdb_id=pdb_name, chain_id=chain_id, top_k=5)
 
+            # ---- show confidence clearly
+            conf_mode = scan_prior["confidence"].mode()[0]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Confidence", conf_mode)
+            c2.metric("CNN OK rate", f"{scan_prior['cnn_ok'].mean():.2f}")
+            c3.metric("GNN OK rate", f"{scan_prior['gnn_ok'].mean():.2f}")
+
             st.markdown("### 19-AA scan (ranked by ensemble; lower = more stabilizing)")
-            st.dataframe(scan_prior, use_container_width=True)
+            st.dataframe(
+                scan_prior[["mutation","ens","ddg_class","confidence","cnn_ok","gnn_ok","xgb","cnn","gnn","rank_stabilizing","pct","highlight","PDB_ID","chain"]],
+                use_container_width=True
+            )
 
             st.markdown("### Bar plot (ensemble ΔΔG per mutation)")
             st.bar_chart(scan_prior.set_index("mutation")["ens"])
@@ -541,22 +525,19 @@ with right:
                 mime="text/csv"
             )
 
-    # ==========================================================
+    # -------------------------
     # TAB 2: FASTA MODE (XGB ONLY)
-    # ==========================================================
+    # -------------------------
     with tab_fasta:
         st.markdown("### Paste FASTA and run 19-AA scan (sequence-based, XGB only)")
-
         fasta_text = st.text_area(
             "FASTA sequence (or raw sequence)",
             height=200,
             placeholder=">my_protein\nMSTNPKPQR...\n",
             key="fasta_text"
         )
-
         fasta_label = st.text_input("Protein label (for output filenames)", value="FASTA_PROTEIN", key="fasta_label")
         pos_fa = st.number_input("Position (1-based residue number)", min_value=1, value=66, step=1, key="fasta_pos")
-
         run_fa = st.button("Run 19-AA scan (FASTA mode)", key="run_fasta")
 
         if run_fa:
@@ -567,7 +548,6 @@ with right:
 
             try:
                 booster, bias, cnn_model, gnn_model, meta = load_models()
-                st.success(f"XGB loaded. Bias={bias:.4f} (FASTA mode uses XGB only)")
             except Exception as e:
                 st.error(f"Model load failed: {e}")
                 st.stop()
@@ -577,14 +557,19 @@ with right:
                 st.error(f"Position {int(pos_fa)} is out of range (sequence length={len(seq)}) or contains invalid AA.")
                 st.stop()
 
+            st.success(f"XGB loaded. Bias={bias:.4f} (FASTA mode uses XGB only)")
             st.info(f"FASTA length: {len(seq)} | position: {int(pos_fa)} | WT from FASTA: {wt} | Mode: XGB only")
 
             scan_df, wt_used = scan_19aa_xgb_only(seq, int(pos_fa), booster, bias)
-            # Use your existing prioritize_scan (it will mark confidence Low because cnn_ok/gnn_ok are False)
             scan_prior = prioritize_scan(scan_df, pdb_id=fasta_label.strip().upper(), chain_id="FASTA", top_k=5)
 
+            st.metric("Confidence", "Low (XGB only)")
+
             st.markdown("### 19-AA scan (XGB-only; lower = more stabilizing)")
-            st.dataframe(scan_prior, use_container_width=True)
+            st.dataframe(
+                scan_prior[["mutation","ens","ddg_class","confidence","xgb","rank_stabilizing","pct","highlight","PDB_ID","chain"]],
+                use_container_width=True
+            )
 
             st.markdown("### Bar plot (XGB ΔΔG per mutation)")
             st.bar_chart(scan_prior.set_index("mutation")["ens"])
@@ -596,63 +581,8 @@ with right:
                 file_name=f"scan_{fasta_label.strip().upper()}_pos{int(pos_fa)}_XGBonly.csv",
                 mime="text/csv"
             )
-    uploaded = st.file_uploader("Upload a PDB file", type=["pdb"])
-    chain_id = st.text_input("Chain ID", value="A", max_chars=2)
-    pos = st.number_input("Position (residue number)", min_value=1, value=66, step=1)
-    wt_override = st.text_input("WT AA override (optional, 1-letter)", value="").strip().upper()
 
-    run = st.button("Run 19-AA scan")
 
-    if run:
-        if uploaded is None:
-            st.error("Please upload a PDB file.")
-            st.stop()
-
-        pdb_bytes = uploaded.getvalue()
-        pdb_name = Path(uploaded.name).stem.upper()
-        pdb_path = TMP_DIR / f"{pdb_name}.pdb"
-        pdb_path.write_bytes(pdb_bytes)
-
-        try:
-            booster, bias, cnn_model, gnn_model = load_models()
-            st.success(f"Models loaded. XGB bias = {bias:.4f}")
-        except Exception as e:
-            st.error(f"Model load failed: {e}")
-            st.stop()
-
-        wt_aa = wt_override if wt_override in AA_INDEX else wt_aa_from_pdb(str(pdb_path), chain_id, int(pos))
-        if wt_aa is None:
-            st.error("Could not detect WT AA from PDB at this chain/position. Please enter WT override.")
-            st.stop()
-
-        st.info(f"Using PDB: {pdb_name}.pdb | chain: {chain_id} | position: {int(pos)} | WT: {wt_aa}")
-
-        scan_df = scan_19aa(
-            pdb_path=str(pdb_path),
-            chain_id=chain_id,
-            pos=int(pos),
-            wt_aa=wt_aa,
-            booster=booster,
-            bias=bias,
-            cnn_model=cnn_model,
-            gnn_model=gnn_model,
-            weights=weights
-        )
-        scan_prior = prioritize_scan(scan_df, pdb_id=pdb_name, chain_id=chain_id, top_k=5)
-
-        st.markdown("### 19-AA scan (ranked by ensemble; lower = more stabilizing)")
-        st.dataframe(scan_prior, use_container_width=True)
-
-        st.markdown("### Bar plot (ensemble ΔΔG per mutation)")
-        st.bar_chart(scan_prior.set_index("mutation")["ens"])
-
-        csv_bytes = scan_prior.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download CSV",
-            data=csv_bytes,
-            file_name=f"scan_{pdb_name}_{chain_id}_pos{int(pos)}.csv",
-            mime="text/csv"
-        )
 
 
 
